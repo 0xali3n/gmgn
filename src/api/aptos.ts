@@ -13,6 +13,31 @@ export interface SwapTransaction {
   contract: string;
 }
 
+// Interface for trader statistics
+export interface TraderStats {
+  address: string;
+  totalTrades: number;
+  buyTrades: number;
+  sellTrades: number;
+  totalVolume: number;
+  estimatedPnL: number;
+  winRate: number;
+  avgTradeSize: number;
+  lastTradeTime: string;
+  topTokens: { token: string; trades: number }[];
+}
+
+// Interface for trade analysis
+export interface TradeAnalysis {
+  token: string;
+  totalTrades: number;
+  totalVolume: number;
+  avgPrice: number;
+  firstTrade: string;
+  lastTrade: string;
+  estimatedPnL: number;
+}
+
 // Comprehensive token mapping based on Aptos fungible assets
 // This includes the most common tokens found on Aptos with real contract addresses
 const TOKEN_MAPPINGS: { [key: string]: string } = {
@@ -620,7 +645,16 @@ export const fetchTransactions = async (
           action,
           contract: tx.payload?.function || "N/A",
         };
-      });
+      })
+      // Filter out transactions with N/A data
+      .filter(
+        (tx: SwapTransaction) =>
+          tx.fromToken !== "N/A" &&
+          tx.toToken !== "N/A" &&
+          tx.fromAmount !== "N/A" &&
+          tx.toAmount !== "N/A" &&
+          tx.hash !== "N/A"
+      );
 
     return swapTransactions;
   } catch (error) {
@@ -639,4 +673,216 @@ export const fetchTransactions = async (
 
     throw new Error("Failed to fetch transactions. Please try again.");
   }
+};
+
+// Helper function to calculate estimated PnL for a trader
+const calculateEstimatedPnL = (transactions: SwapTransaction[]): number => {
+  const tokenHoldings: {
+    [token: string]: { amount: number; avgPrice: number };
+  } = {};
+  let totalPnL = 0;
+
+  for (const tx of transactions) {
+    const fromAmount = parseFloat(tx.fromAmount) || 0;
+    const toAmount = parseFloat(tx.toAmount) || 0;
+
+    if (tx.action === "Buy") {
+      // Buying token with AptosCoin
+      const token = tx.toToken;
+      const aptPrice = fromAmount / toAmount; // Price in AptosCoin per token
+
+      if (!tokenHoldings[token]) {
+        tokenHoldings[token] = { amount: 0, avgPrice: 0 };
+      }
+
+      const currentAmount = tokenHoldings[token].amount;
+      const currentAvgPrice = tokenHoldings[token].avgPrice;
+      const newAmount = currentAmount + toAmount;
+      const newAvgPrice =
+        currentAmount > 0
+          ? (currentAmount * currentAvgPrice + toAmount * aptPrice) / newAmount
+          : aptPrice;
+
+      tokenHoldings[token] = { amount: newAmount, avgPrice: newAvgPrice };
+    } else if (tx.action === "Sell") {
+      // Selling token for AptosCoin
+      const token = tx.fromToken;
+      const aptReceived = toAmount;
+      const tokensSold = fromAmount;
+
+      if (tokenHoldings[token] && tokenHoldings[token].amount > 0) {
+        const avgPrice = tokenHoldings[token].avgPrice;
+        const costBasis = tokensSold * avgPrice;
+        const pnl = aptReceived - costBasis;
+        totalPnL += pnl;
+
+        tokenHoldings[token].amount -= tokensSold;
+        if (tokenHoldings[token].amount < 0) {
+          tokenHoldings[token].amount = 0;
+        }
+      }
+    }
+  }
+
+  return totalPnL;
+};
+
+// Helper function to get top tokens by trade count
+const getTopTokens = (
+  transactions: SwapTransaction[]
+): { token: string; trades: number }[] => {
+  const tokenCounts: { [token: string]: number } = {};
+
+  for (const tx of transactions) {
+    if (tx.action === "Buy") {
+      tokenCounts[tx.toToken] = (tokenCounts[tx.toToken] || 0) + 1;
+    } else if (tx.action === "Sell") {
+      tokenCounts[tx.fromToken] = (tokenCounts[tx.fromToken] || 0) + 1;
+    }
+  }
+
+  return Object.entries(tokenCounts)
+    .map(([token, trades]) => ({ token, trades }))
+    .sort((a, b) => b.trades - a.trades)
+    .slice(0, 5);
+};
+
+// Calculate trader statistics
+export const calculateTraderStats = (
+  address: string,
+  transactions: SwapTransaction[]
+): TraderStats => {
+  const buyTrades = transactions.filter((tx) => tx.action === "Buy").length;
+  const sellTrades = transactions.filter((tx) => tx.action === "Sell").length;
+  const totalTrades = transactions.length;
+
+  // Calculate total volume (in AptosCoin equivalent)
+  const totalVolume = transactions.reduce((sum, tx) => {
+    if (tx.action === "Buy") {
+      return sum + (parseFloat(tx.fromAmount) || 0);
+    } else {
+      return sum + (parseFloat(tx.toAmount) || 0);
+    }
+  }, 0);
+
+  const estimatedPnL = calculateEstimatedPnL(transactions);
+  const winRate =
+    totalTrades > 0 ? ((buyTrades + sellTrades) / totalTrades) * 100 : 0;
+  const avgTradeSize = totalTrades > 0 ? totalVolume / totalTrades : 0;
+  const lastTradeTime =
+    transactions.length > 0 ? transactions[0].timestamp : "N/A";
+  const topTokens = getTopTokens(transactions);
+
+  return {
+    address,
+    totalTrades,
+    buyTrades,
+    sellTrades,
+    totalVolume,
+    estimatedPnL,
+    winRate,
+    avgTradeSize,
+    lastTradeTime,
+    topTokens,
+  };
+};
+
+// Fetch multiple traders' data
+export const fetchMultipleTraders = async (
+  addresses: string[]
+): Promise<TraderStats[]> => {
+  const traderStats: TraderStats[] = [];
+
+  for (const address of addresses) {
+    try {
+      const transactions = await fetchTransactions(address, 100);
+      const stats = calculateTraderStats(address, transactions);
+      traderStats.push(stats);
+    } catch (error) {
+      console.error(`Error fetching data for ${address}:`, error);
+      // Add empty stats for failed addresses
+      traderStats.push({
+        address,
+        totalTrades: 0,
+        buyTrades: 0,
+        sellTrades: 0,
+        totalVolume: 0,
+        estimatedPnL: 0,
+        winRate: 0,
+        avgTradeSize: 0,
+        lastTradeTime: "N/A",
+        topTokens: [],
+      });
+    }
+  }
+
+  return traderStats.sort((a, b) => b.estimatedPnL - a.estimatedPnL);
+};
+
+// Get detailed trade analysis for a specific trader
+export const getTraderAnalysis = async (
+  address: string
+): Promise<{
+  stats: TraderStats;
+  transactions: SwapTransaction[];
+  tokenAnalysis: TradeAnalysis[];
+}> => {
+  const transactions = await fetchTransactions(address, 100);
+  const stats = calculateTraderStats(address, transactions);
+
+  // Analyze trades by token
+  const tokenAnalysis: TradeAnalysis[] = [];
+  const tokenData: {
+    [token: string]: {
+      trades: SwapTransaction[];
+      totalVolume: number;
+      buyVolume: number;
+      sellVolume: number;
+    };
+  } = {};
+
+  for (const tx of transactions) {
+    const token = tx.action === "Buy" ? tx.toToken : tx.fromToken;
+    if (!tokenData[token]) {
+      tokenData[token] = {
+        trades: [],
+        totalVolume: 0,
+        buyVolume: 0,
+        sellVolume: 0,
+      };
+    }
+
+    tokenData[token].trades.push(tx);
+    const volume =
+      tx.action === "Buy" ? parseFloat(tx.fromAmount) : parseFloat(tx.toAmount);
+    tokenData[token].totalVolume += volume;
+
+    if (tx.action === "Buy") {
+      tokenData[token].buyVolume += parseFloat(tx.fromAmount);
+    } else {
+      tokenData[token].sellVolume += parseFloat(tx.toAmount);
+    }
+  }
+
+  for (const [token, data] of Object.entries(tokenData)) {
+    const tokenPnL = calculateEstimatedPnL(data.trades);
+    const avgPrice =
+      data.trades.length > 0 ? data.totalVolume / data.trades.length : 0;
+
+    tokenAnalysis.push({
+      token,
+      totalTrades: data.trades.length,
+      totalVolume: data.totalVolume,
+      avgPrice,
+      firstTrade: data.trades[data.trades.length - 1]?.timestamp || "N/A",
+      lastTrade: data.trades[0]?.timestamp || "N/A",
+      estimatedPnL: tokenPnL,
+    });
+  }
+
+  return {
+    stats,
+    transactions,
+    tokenAnalysis: tokenAnalysis.sort((a, b) => b.totalTrades - a.totalTrades),
+  };
 };
